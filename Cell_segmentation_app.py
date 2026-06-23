@@ -1,9 +1,7 @@
 import sys
 import os
 import csv
-import glob
-import threading
-
+from PIL import Image
 import cv2
 import numpy as np
 from scipy.ndimage import label, maximum_filter
@@ -38,66 +36,40 @@ def count_cells_in_image(img_path: str):
     Count cells in a red-channel fluorescence image.
     Returns (cell_count, annotated_bgr_image).
 
-    Algorithm:
-    1. Extract red channel (NeuN-Cy3 stain lives entirely there).
-    2. Gaussian blur + Otsu threshold + morphological clean-up.
-    3. Distance transform to find cell-body interiors.
-    4. Adaptive local-maxima suppression window estimated from foreground
-       density and a noise-ratio signal derived from seeds at win=80.
-    5. Each surviving local maximum = one cell centre.
     """
-    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+    img = Image.open(img_path)
     if img is None:
         raise ValueError(f"Cannot read image: {img_path}")
 
-    # Extract red channel (neurons stained with NeuN-Cy3 appear in red channel)
-    if len(img.shape) == 3:
-        red = img[:, :, 2]
-    else:
-        red = img
+    img = np.array(img)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
 
-    # Blur to smooth noise
-    blurred = cv2.GaussianBlur(red, (5, 5), 1.5)
+    filename = img_path.split("/")[-1]
+    
+    img_mask = Image.open(f"/home/romasa/Work/Research_Work/DAIR3_collab/Proper_vision/predicted_masks/{filename[:-4]}.png")
+    img_mask = np.array(img_mask)
+    img_mask_bw = img_mask > 0  # Convert to binary mask
+    img_mask_bw = img_mask_bw.astype(np.uint8)  # Convert to uint8
+    
+    cell_count = len(np.unique(img_mask)) - 1  # Subtract 1 to exclude background
+    mask_ids = np.unique(img_mask)
+    mask_ids = mask_ids[mask_ids != 0]  # Exclude background ID
+    print(f"Loaded mask for {filename}: {img_mask.shape=}, {cell_count=}, {np.max(img_mask_bw)=}")
+    
+    # Build annotated image for display with individual contours for each labeled mask
+    display_rgb = img.copy()
+    for mask_id in mask_ids:
+        region = (img_mask == mask_id).astype(np.uint8)
+        contours, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(display_rgb, contours, -1, (0, 255, 0), 2)
+    
+    print(f"{display_rgb.shape=}, {img_mask.shape=}, {img.shape=}")
+    print(f"Processed {filename}: {cell_count} cells detected.")
 
-    # Otsu threshold to separate cells from background
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Morphological cleanup
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    fg_frac = float((binary == 255).sum()) / binary.size
-
-    # Distance transform to find cell centers
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-
-    # --- Method A: adaptive local-maxima window ---
-    win = _adaptive_window(fg_frac)
-    local_max_a = (dist == maximum_filter(dist, size=win)) & (dist > 2)
-    _, count_a = label(local_max_a)
-
-    # --- Method B: h-maxima prominence filter ---
-    # Only keep peaks that rise ≥ h above their local surroundings.
-    # Calibrated on 129 images: h = 0.71/fg + 2.17
-    h_val = float(max(1.0, 0.71 / fg_frac + 2.17))
-    peaks_b = h_maxima(dist, h=h_val)
-    _, count_b = label(peaks_b)
-
-    # Ensemble: average the two independent estimates
-    cell_count = round((count_a + count_b) / 2)
-
-    # Build annotated image for display
-    display = cv2.normalize(red, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-    display_bgr = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
-
-    # Find centroid coordinates from the adaptive-window maxima (for display)
-    from scipy.ndimage import center_of_mass
-    labeled_max, n_max = label(local_max_a)
-    centers = center_of_mass(local_max_a, labeled_max, range(1, n_max + 1))
-    for cy, cx in centers:
-        cv2.circle(display_bgr, (int(cx), int(cy)), 6, (0, 255, 0), 2)
-
+    display_bgr = cv2.cvtColor(display_rgb, cv2.COLOR_RGB2BGR)
     return cell_count, display_bgr
 
 
@@ -474,12 +446,15 @@ class CellCounterApp(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
-    app = QApplication(sys.argv)
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
     app.setApplicationName("Cell Counter")
     window = CellCounterApp()
     window.show()
     sys.exit(app.exec_())
-
+    
 
 if __name__ == "__main__":
     main()
